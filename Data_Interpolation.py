@@ -2,10 +2,11 @@
 PCHIP 分段三次埃尔米特插值 — 水质数据预处理
 
 功能:
-1. 读取单个 CSV 文件（含时间列 + 5站点×6指标列）
-2. 检测并处理缺失值
-3. 使用 PCHIP 插值填充缺失和加密时间分辨率
-4. 输出插值后的 CSV 文件
+1. 读取长格式原始 CSV（中文列名，每个站点一行）
+2. 清洗非数值（如 "<0.02" 低于检出限）
+3. 转换为下游模型所需的宽格式（每行=时间戳，每列=站点×指标）
+4. 使用 PCHIP 插值填充缺失和加密时间分辨率
+5. 输出插值后的 CSV 文件
 
 PCHIP (Piecewise Cubic Hermite Interpolating Polynomial):
 - 保单调性的三次插值
@@ -15,6 +16,7 @@ PCHIP (Piecewise Cubic Hermite Interpolating Polynomial):
 
 import os
 import sys
+import re
 import numpy as np
 import pandas as pd
 from scipy.interpolate import PchipInterpolator
@@ -32,111 +34,168 @@ from config import (
     INDICATORS,
     INDICATOR_NAMES,
     STATION_NAMES,
+    RAW_COL_TIME,
+    RAW_COL_STATION,
+    RAW_INDICATOR_MAP,
+    DETECTION_LIMIT_REPLACE,
     get_csv_columns,
 )
 
 
-def generate_sample_data(
-    output_path: str,
-    n_days: int = 365,
-    missing_ratio: float = 0.05,
-    seed: int = 42,
-):
+def _clean_value(val):
     """
-    生成模拟水质数据（用于代码测试）。
-
-    数据特征:
-    - 周期性（日变化 + 季节变化）
-    - 指标间存在相关性
-    - 添加随机噪声和缺失值
+    清洗单个数值：将非数值字符串（如 "<0.02"）转换为浮点数。
 
     Args:
-        output_path:   输出 CSV 路径
-        n_days:        时间点数（如 365 天）
-        missing_ratio: 随机缺失比例
-        seed:          随机种子
+        val: 原始单元格值
+
+    Returns:
+        float 或 np.nan
     """
-    np.random.seed(seed)
+    if isinstance(val, (int, float, np.floating, np.integer)):
+        if np.isnan(float(val)):
+            return np.nan
+        return float(val)
 
-    # 生成时间列
-    time_index = pd.date_range(start="2024-01-01", periods=n_days, freq="D")
+    val_str = str(val).strip()
+    if not val_str:
+        return np.nan
 
-    data = {}
-    data[INTERP_TIME_COLUMN] = time_index.strftime("%Y-%m-%d %H:%M:%S")
+    # 先检查检出限替换表
+    if val_str in DETECTION_LIMIT_REPLACE:
+        return DETECTION_LIMIT_REPLACE[val_str]
 
-    # 各指标的基础值 + 周期模式
-    base_params = {
-        "PH":    (7.5, 0.5, 0.3),     # (均值, 年振幅, 日振幅)
-        "DO":    (8.0, 2.0, 0.5),
-        "COND":  (400, 100, 20),
-        "TURB":  (10,  8,   3),
-        "NH3N":  (0.5, 0.3, 0.1),
-        "COD":   (4.0, 2.0, 0.5),
-    }
+    # 尝试直接转换
+    try:
+        return float(val_str)
+    except ValueError:
+        # 尝试提取数字（处理 "<0.02" 这类不在表中的变体）
+        match = re.search(r'[\d.]+', val_str)
+        if match:
+            return float(match.group(0))
+        return np.nan
 
-    for station_idx in range(1, TOTAL_STATIONS + 1):
-        s_offset = np.random.randn() * 0.2  # 站点偏移
-        for ind_name in INDICATOR_NAMES:
-            col_name = f"Station{station_idx}_{ind_name}"
-            base, annual_amp, daily_amp = base_params[ind_name]
 
-            # 年周期
-            t = np.arange(n_days)
-            annual = annual_amp * np.sin(2 * np.pi * t / 365 + s_offset)
-            # 日周期（简化）
-            daily = daily_amp * np.sin(2 * np.pi * t / 1 + s_offset)
+def _extract_station_index(name: str) -> int:
+    """
+    从站点名称提取编号（1-based）。
 
-            values = base + annual + daily + np.random.randn(n_days) * daily_amp * 0.5
+    示例:
+        "白洋湾金墅水源地1" → 1
+        "白洋湾金墅水源地5" → 5
 
-            # 注入缺失值
-            mask = np.random.random(n_days) < missing_ratio
-            values[mask] = np.nan
+    Args:
+        name: 站点名称字符串
 
-            data[col_name] = values
-
-    df = pd.DataFrame(data)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    df.to_csv(output_path, index=False)
-    print(f"模拟数据已生成: {output_path}")
-    print(f"  时间点数: {n_days}")
-    print(f"  站点数: {TOTAL_STATIONS}")
-    print(f"  指标数: {INDICATORS}")
-    print(f"  缺失比例: {missing_ratio:.1%}")
-    return df
+    Returns:
+        站点编号 (1 ~ TOTAL_STATIONS)
+    """
+    match = re.search(r'(\d+)$', name.strip())
+    if match:
+        return int(match.group(1))
+    raise ValueError(f"无法从站点名称中提取编号: {name}")
 
 
 def load_data(path: str) -> Tuple[pd.DataFrame, pd.DatetimeIndex, np.ndarray]:
     """
-    加载水质 CSV 文件。
+    加载长格式水质 CSV 文件，清洗并转换为宽格式。
+
+    输入格式（长格式）:
+        采样日期, 点位名称, 采样经度, 采样纬度, pH值, 溶解氧, 电导率, 浑浊度, 氨氮, 耗氧量
+        2021/6/21, 白洋湾金墅水源地1, 120.3813, 31.3749, 8.1, 6.85, 452, 12, 0.06, 2.87
+
+    输出格式（宽格式）:
+        time, Station1_PH, Station1_DO, ..., Station5_COD
+        2021-06-21 00:00:00, 8.1, 6.85, ..., 2.79
 
     Returns:
-        df:         原始 DataFrame
-        time_index:  时间索引
+        df_wide:     宽格式 DataFrame（含 time 列和所有 Station{N}_{Indicator} 列）
+        time_index:   时间索引
         data_array:  (T, N_stations, C) numpy 数组
     """
-    df = pd.read_csv(path)
-    time_col = df.columns[0]
-    time_index = pd.to_datetime(df[time_col])
+    df = pd.read_csv(path, encoding="utf-8")
+    print(f"原始数据: {df.shape[0]} 行 × {df.shape[1]} 列")
+    print(f"  列名: {list(df.columns)}")
 
-    data_cols = get_csv_columns()
-    missing_cols = [c for c in data_cols if c not in df.columns]
+    # --- 解析日期 ---
+    df[RAW_COL_TIME] = pd.to_datetime(df[RAW_COL_TIME])
+    print(f"  日期范围: {df[RAW_COL_TIME].min().date()} ~ {df[RAW_COL_TIME].max().date()}")
+    print(f"  唯一日期: {df[RAW_COL_TIME].nunique()}")
+    print(f"  唯一站点: {df[RAW_COL_STATION].nunique()}")
 
+    # --- 清洗每个指标列的数值 ---
+    raw_ind_cols = list(RAW_INDICATOR_MAP.keys())
+    nan_before = 0
+    for col in raw_ind_cols:
+        if col not in df.columns:
+            print(f"  警告: 列 '{col}' 不存在于 CSV 中，跳过")
+            continue
+        # 统计清洗前非数值
+        nan_before += df[col].apply(
+            lambda x: not isinstance(x, (int, float, np.floating, np.integer))
+        ).sum()
+        df[col] = df[col].apply(_clean_value).astype(np.float64)
+
+    nan_after = df[raw_ind_cols].isna().sum().sum()
+    if nan_before > 0:
+        print(f"  清洗非数值: {nan_before} 个 → 替换为数值或 NaN ({int(nan_after)} 个 NaN)")
+
+    # --- 提取站点编号 ---
+    df["_station_idx"] = df[RAW_COL_STATION].apply(_extract_station_index)
+
+    # --- 长格式 → 宽格式 ---
+    # 每条记录: (日期, 站点编号) → {PH: v, DO: v, ...}
+    # 先构建 pivot-friendly 的 DataFrame
+    rows = []
+    for _, row in df.iterrows():
+        date = row[RAW_COL_TIME]
+        s_idx = row["_station_idx"]
+        for cn_name, en_name in RAW_INDICATOR_MAP.items():
+            col_name = f"Station{s_idx}_{en_name}"
+            rows.append({
+                RAW_COL_TIME: date,
+                "column": col_name,
+                "value": row[cn_name],
+            })
+
+    df_pivot = pd.DataFrame(rows)
+    df_wide = df_pivot.pivot_table(
+        index=RAW_COL_TIME,
+        columns="column",
+        values="value",
+        aggfunc="first",  # 每个 (date, column) 组合应唯一
+    ).reset_index()
+
+    # 重命名时间列为输出格式
+    df_wide.rename(columns={RAW_COL_TIME: INTERP_TIME_COLUMN}, inplace=True)
+
+    # 确保所有预期列都存在
+    expected_cols = get_csv_columns()
+    missing_cols = [c for c in expected_cols if c not in df_wide.columns]
     if missing_cols:
-        print(f"警告: CSV 中缺少 {len(missing_cols)} 列，将自动填充为 NaN")
+        print(f"  警告: 缺少 {len(missing_cols)} 列，填充 NaN")
         for c in missing_cols:
-            df[c] = np.nan
+            df_wide[c] = np.nan
 
-    # 提取数据矩阵 (T, N, C)
-    T = len(df)
+    # 按日期排序
+    df_wide.sort_values(INTERP_TIME_COLUMN, inplace=True)
+    df_wide.reset_index(drop=True, inplace=True)
+
+    time_index = pd.to_datetime(df_wide[INTERP_TIME_COLUMN])
+    T = len(df_wide)
+
+    # --- 构建 (T, N, C) 数组 ---
     data_array = np.full((T, TOTAL_STATIONS, INDICATORS), np.nan, dtype=np.float64)
-
     for s in range(TOTAL_STATIONS):
         for c, ind in enumerate(INDICATOR_NAMES):
             col = f"Station{s+1}_{ind}"
-            if col in df.columns:
-                data_array[:, s, c] = df[col].values.astype(np.float64)
+            if col in df_wide.columns:
+                data_array[:, s, c] = df_wide[col].values.astype(np.float64)
 
-    return df, time_index, data_array
+    print(f"\n宽格式: {df_wide.shape[0]} 时间点 × {df_wide.shape[1]-1} 指标列")
+    print(f"  缺失率: {np.isnan(data_array).mean():.2%}")
+
+    return df_wide, time_index, data_array
 
 
 def pchip_interpolate(
@@ -161,8 +220,10 @@ def pchip_interpolate(
         new_time: 插值后的时间索引
         interp_data: (T_new, N, C) 插值后数据
     """
-    # 将时间转为数值（相对于起点的秒数）
-    time_numeric = (time_index - time_index[0]).total_seconds().values
+    # 将时间转为数值（相对于起点的秒数，使用 int64 纳秒表示）
+    time_index = pd.DatetimeIndex(time_index)
+    t0 = time_index.asi8[0]
+    time_numeric = (time_index.asi8 - t0).astype(np.float64) / 1e9
 
     # 生成新的均匀时间网格
     new_time_index = pd.date_range(
@@ -170,12 +231,12 @@ def pchip_interpolate(
         end=time_index.max(),
         freq=freq,
     )
-    new_time_numeric = (new_time_index - time_index[0]).total_seconds().values
+    new_time_numeric = (new_time_index.asi8 - t0).astype(np.float64) / 1e9
 
     T_new = len(new_time_index)
     interp_data = np.zeros((T_new, TOTAL_STATIONS, INDICATORS), dtype=np.float64)
 
-    nan_count_before = np.isnan(data_array).sum()
+    nan_count_before = int(np.isnan(data_array).sum())
     filled_count = 0
 
     for s in range(TOTAL_STATIONS):
@@ -186,18 +247,21 @@ def pchip_interpolate(
             valid = ~np.isnan(series)
 
             if valid.sum() < 4:
-                # 有效数据太少 → 线性插值
-                print(f"警告: Station{s+1}_{INDICATOR_NAMES[c]} 有效点仅 {valid.sum()} 个，"
+                # 有效数据太少 → 降级为线性插值
+                print(f"  警告: Station{s+1}_{INDICATOR_NAMES[c]} 有效点仅 {valid.sum()} 个，"
                       f"使用线性插值")
-                interp_data[:, s, c] = np.interp(
-                    new_time_numeric, time_numeric[valid], series[valid]
-                )
+                if valid.sum() >= 2:
+                    interp_data[:, s, c] = np.interp(
+                        new_time_numeric, time_numeric[valid], series[valid]
+                    )
+                else:
+                    interp_data[:, s, c] = np.nan
             else:
                 # PCHIP 插值
                 pchip = PchipInterpolator(time_numeric[valid], series[valid])
                 interp_data[:, s, c] = pchip(new_time_numeric)
 
-            filled_count += int(np.isnan(series).sum())
+            filled_count += int((~valid).sum())
 
     print(f"\nPCHIP 插值完成:")
     print(f"  原始点数: {len(time_index)} (缺失 {nan_count_before} 个)")
@@ -229,6 +293,7 @@ def save_interpolated(
             data_dict[f"Station{s+1}_{ind}"] = data_array[:, s, c]
 
     df = pd.DataFrame(data_dict)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df.to_csv(output_path, index=False)
     print(f"插值数据已保存: {output_path}")
     print(f"  Shape: {T} × {N*C+1} ({N*C} 数据列 + 1 时间列)")
@@ -242,9 +307,9 @@ def main():
 
     # ---- 检查原始数据是否存在 ----
     if not os.path.exists(RAW_DATA_PATH):
-        print(f"\n原始数据不存在: {RAW_DATA_PATH}")
-        print("生成模拟数据用于测试...")
-        generate_sample_data(RAW_DATA_PATH, n_days=180, missing_ratio=0.05)
+        print(f"\n[错误] 原始数据文件不存在: {RAW_DATA_PATH}")
+        print("请确认数据文件路径是否正确。")
+        sys.exit(1)
 
     # ---- 加载 ----
     df, time_index, data_array = load_data(RAW_DATA_PATH)

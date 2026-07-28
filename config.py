@@ -19,9 +19,9 @@ def _get_device():
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DATA_DIR = os.path.join(BASE_DIR, "data")
-RAW_DATA_PATH = os.path.join(DATA_DIR, "raw_water_quality.csv")       # 原始 CSV
-INTERPOLATED_DATA_PATH = os.path.join(DATA_DIR, "interpolated.csv")   # PCHIP 插值后
-PROCESSED_DATA_DIR = os.path.join(DATA_DIR, "processed")              # GAF 图像 + 样本存放目录
+RAW_DATA_PATH = r"C:\Users\cw\Documents\data\water_quality_data.csv"  # 原始 CSV
+INTERPOLATED_DATA_PATH = os.path.join(DATA_DIR, "interpolated.csv")    # PCHIP 插值后
+PROCESSED_DATA_DIR = os.path.join(DATA_DIR, "processed")               # GAF 图像 + 样本存放目录
 
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -50,6 +50,25 @@ INDICATOR_NAMES = [
 
 STATION_NAMES = [f"Station_{i+1}" for i in range(TOTAL_STATIONS)]
 
+# 原始 CSV 的列名映射（中文 → 内部英文）
+RAW_COL_TIME = "采样日期"
+RAW_COL_STATION = "点位名称"
+RAW_COL_LON = "采样经度"
+RAW_COL_LAT = "采样纬度"
+RAW_INDICATOR_MAP = {
+    "pH值":  "PH",
+    "溶解氧": "DO",
+    "电导率": "COND",
+    "浑浊度": "TURB",
+    "氨氮":  "NH3N",
+    "耗氧量": "COD",
+}
+
+# 低于检出限的值替换为 DL/2
+DETECTION_LIMIT_REPLACE = {
+    "<0.02": 0.01,               # 氨氮检出限 0.02，替换为 0.01
+}
+
 # CSV 列名生成（假设格式: Station1_PH, Station1_DO, ..., Station5_COD）
 def get_csv_columns():
     """返回 CSV 中所有数据列的列表（不含时间列）"""
@@ -62,8 +81,8 @@ def get_csv_columns():
 # ============================================================================
 # PCHIP 插值配置
 # ============================================================================
-INTERP_TIME_COLUMN = "time"          # CSV 中的时间列名
-INTERP_FREQUENCY = "1H"              # 插值目标频率: "1H"(每小时), "30T"(每30分钟), "D"(每天)
+INTERP_TIME_COLUMN = "time"          # 输出的时间列名
+INTERP_FREQUENCY = "1h"              # 插值目标频率: "1h"(每小时), "30min"(每30分钟), "D"(每天)
 INTERP_METHOD = "PCHIP"              # 插值方法: PCHIP / linear / cubic
 
 # ============================================================================
